@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "thebundl"
+version = "0.1.0"
+description = "Food-deal source discovery and collection pipeline"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "groq>=0.15",
+  "httpx>=0.27",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "python-dotenv>=1.0",
+  "supabase>=2.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+
+[project.scripts]
+thebundl = "thebundl.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.hatch.build.targets.wheel]
+packages = ["thebundl"]

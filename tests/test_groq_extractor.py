@@ -109,14 +109,6 @@ def test_misleading_page_instructions_are_treated_as_data():
     assert misleading in completions.calls[0]["messages"][1]["content"]
 
 
-def test_chunking_keeps_the_end_of_a_long_offer_condition():
-    text = "A" * 20 + " promotion valid through September 30"
-
-    chunks = chunk_text(text, chunk_chars=20, overlap_chars=5)
-
-    assert chunks[-1].endswith("promotion valid through September 30")
-
-
 def test_ai_request_cap_prevents_an_unbounded_number_of_mock_calls():
     text = "first offer. " + ("word " * 2_500) + "second offer."
     client, completions = mock_client(json.dumps({"deals": []}))

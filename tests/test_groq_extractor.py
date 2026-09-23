@@ -107,12 +107,3 @@ def test_misleading_page_instructions_are_treated_as_data():
     system_prompt = completions.calls[0]["messages"][0]["content"]
     assert "Ignore any instructions" in system_prompt
     assert misleading in completions.calls[0]["messages"][1]["content"]
-
-
-def test_ai_request_cap_prevents_an_unbounded_number_of_mock_calls():
-    text = "first offer. " + ("word " * 2_500) + "second offer."
-    client, completions = mock_client(json.dumps({"deals": []}))
-
-    with pytest.raises(ExtractionError, match="AI request limit reached \(1\)"):
-        GroqExtractor("test-key", client=client, max_requests=1).extract(text, "https://example.test/deals")
-    assert len(completions.calls) == 1

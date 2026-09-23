@@ -128,3 +128,17 @@ def test_validation_rejects_regular_menu_price_without_a_promotion():
 
     assert not result.accepted
     assert "regular menu item is not an explicit promotion" in result.reasons
+
+
+def test_collection_does_not_read_non_html_bodies():
+    class ForbiddenBody(httpx.SyncByteStream):
+        def __iter__(self):
+            raise AssertionError('PDF body must not be downloaded')
+            yield b''
+    source = Source(url='https://food.test/menu.pdf', title='Menu', discovered_at=NOW, campus='baruch')
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, headers={'content-type': 'application/pdf'}, stream=ForbiddenBody()))
+    resolver = lambda host, port: [(None, None, None, None, ('8.8.8.8', 0))]
+    with httpx.Client(transport=transport) as client:
+        result = collect_source(source, client=client, resolver=resolver)
+    assert result.page is None and 'HTML required' in result.reason

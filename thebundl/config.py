@@ -36,12 +36,14 @@ class Settings(BaseSettings):
     supabase_key: SecretStr | None = None
     ai_provider: str = "groq"
     ai_model: str = "openai/gpt-oss-20b"
-    discovery_interval_days: int = Field(default=14, ge=1)
-    collection_interval_hours: int = Field(default=24, ge=1)
+    discovery_interval_days: int = Field(default=14, ge=14)
+    collection_interval_hours: int = Field(default=24, ge=24)
     brave_search_budget_usd: float = Field(default=5.0, ge=0)
     brave_search_cost_per_request_usd: float = Field(default=0.0, ge=0)
     max_search_requests_per_run: int = Field(default=12, ge=0)
     max_ai_requests_per_run: int = Field(default=24, ge=0)
+    ai_budget_usd: float = Field(default=1.0, ge=0)
+    ai_cost_per_request_usd: float = Field(default=0.05, gt=0)
     max_sources_per_run: int = Field(default=20, ge=1)
     http_timeout_seconds: float = Field(default=15.0, gt=0)
     domain_pacing_seconds: float = Field(default=1.0, ge=0)

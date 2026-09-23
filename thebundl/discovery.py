@@ -125,11 +125,14 @@ def discover_sources(settings: Settings, limit: int, *, search_client: SearchCli
             break
         if spend + settings.brave_search_cost_per_request_usd > settings.brave_search_budget_usd:
             break
+        requests_used += 1
+        spend += settings.brave_search_cost_per_request_usd
+        _save_ledger(settings, {"search_spend_usd": spend, "last_discovery_at": timestamp.isoformat(),
+                                "last_requests_used": requests_used})
         try:
             results = search_client.search(query, count=min(limit, 20))
         except Exception as error:
             raise RuntimeError(f"Source discovery failed for query {query!r}: {error.__class__.__name__}") from error
-        requests_used += 1
         for result in results:
             try:
                 title = result.get("title", "")
@@ -138,9 +141,11 @@ def discover_sources(settings: Settings, limit: int, *, search_client: SearchCli
                                     ("deals", "specials", "happy hour", "promotions", "offers"))))
             except (KeyError, ValueError):
                 continue
-        spend += settings.brave_search_cost_per_request_usd
+    if requests_used == 0:
+        raise RuntimeError("Discovery budget exhausted; check search request and monetary limits")
     _save_ledger(settings, {"search_spend_usd": spend, "last_discovery_at": timestamp.isoformat(),
                             "last_requests_used": requests_used})
+    leads = sorted(deduplicate_sources(leads), key=lambda source: source.priority, reverse=True)[:limit]
     sources = deduplicate_sources(known_sources(settings) + leads)
     _save_sources(settings, sources)
     return sorted(deduplicate_sources(leads), key=lambda source: source.priority, reverse=True)[:limit]

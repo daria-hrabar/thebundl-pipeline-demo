@@ -47,7 +47,7 @@ def existing_fingerprints(settings: Settings, fingerprints: list[str], *, client
 
 def publish_candidates(settings: Settings, candidates: list[DealCandidate], *, client: Any | None = None) -> int:
     """Insert validated non-duplicates into pipeline_deals in the test project."""
-    rows = [deal_row(candidate) for candidate in candidates]
+    rows = list({candidate.fingerprint: deal_row(candidate) for candidate in candidates}.values())
     if not rows:
         return 0
     database = client or _client(settings)
@@ -56,7 +56,9 @@ def publish_candidates(settings: Settings, candidates: list[DealCandidate], *, c
     if not rows:
         return 0
     try:
-        database.table("pipeline_deals").insert(rows).execute()
+        response = database.table("pipeline_deals").insert(rows).execute()
     except Exception as error:
         raise RuntimeError(f"Could not publish deals to Supabase: {error.__class__.__name__}") from error
-    return len(rows)
+    if response.data is None or len(response.data) != len(rows):
+        raise RuntimeError("Supabase did not confirm inserted rows; verify publication before retrying")
+    return len(response.data)

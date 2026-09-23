@@ -37,8 +37,8 @@ python -m thebundl check-config
 | Command | Purpose |
 | --- | --- |
 | `python -m thebundl check-config` | Shows whether required settings exist without showing values. |
-| `python -m thebundl discover --dry-run --limit 10` | Records a bounded source-discovery dry run. |
-| `python -m thebundl run --dry-run --limit 5` | Records a no-publish pipeline dry run. |
+| `python -m thebundl discover --dry-run --limit 10` | Executes bounded discovery and saves sources locally; never writes to Supabase. |
+| `python -m thebundl run --dry-run --limit 5` | Executes discovery when due, HTML collection, extraction, validation and deduplication; saves local results. |
 | `python -m thebundl run --publish --limit 5` | Runs with publication enabled only when Supabase credentials are configured. |
 | `python -m thebundl report --days 7` | Writes the actual-count weekly-report artifact. |
 
@@ -74,6 +74,16 @@ All tests use mocked Groq, search, HTTP, geocoding, and Supabase responses. They
 ## Current limitations and improvements
 
 - Input is HTML text, links, and JSON-LD only. JavaScript-rendered content, images, video, PDFs, and OCR are intentionally excluded.
-- Geocoding requires a configured, rate-limited provider and cache; ambiguous addresses are rejected.
-- Scheduled CLI orchestration and live publication need operational credentials and should be exercised first against the separate test Supabase project.
-- Future visual-media analysis could add accessible image metadata or a separately consented vision pipeline, but it must retain source attribution, cost controls, privacy review, and the same evidence/location checks. It is not part of this pipeline today.
+- Branch verification currently uses a matching business name, exact street/full address, and valid coordinates from the collected page’s JSON-LD. Missing or ambiguous matches are rejected. The geocoder interface/cache remain available for a future external provider; no external geocoding service is configured.
+- Live CLI execution requires operational credentials. Configure `SUPABASE_URL` and `SUPABASE_KEY` exclusively for the dedicated test project. Publication uses the existing `pipeline_deals` table without schema changes.
+- Similar-offer matching is a helper only; this execution path uses exact fingerprints and the database unique constraint, not semantic duplicate classification.
+
+### Execution state and limits
+
+The earlier CLI unconditionally called a placeholder artifact writer and exited with code 3. Discovery, HTML collection, Groq extraction, validation, deduplication and Supabase storage were implemented but disconnected. The daily collector stopped before extraction; geocoding had only a protocol/cache; reporting always returned zero. Commands now execute and exit with code 0 on success or 1 on stage failure. JSON artifacts contain actual counts, accepted/rejected results, and sanitized stage errors. `pages_fetched` counts successfully collected HTML pages; `pages_reused` counts cached pages processed without a new fetch.
+
+`--limit` caps source pages processed (also bounded by `MAX_SOURCES_PER_RUN`). This minimum execution path fetches the selected source pages; it does not recursively fetch promotion links. Discovery runs no more often than every 14 days. Collection attempts are recorded per URL before fetching and run no more often than every 24 hours. Successfully collected pages are reused within that interval, allowing `run --publish` immediately after a dry run. Failed collection attempts remain subject to the daily interval. Retain the ignored `work/` directory to preserve schedules and local reports. Run one CLI process at a time; local state is not a distributed scheduler.
+
+Dry runs perform real provider requests and may incur costs. They never write to Supabase. With test Supabase credentials they read fingerprints for database duplicate checks; without those credentials they deduplicate within the current run only. Dry-run candidates are not treated as published. Publish checks stored fingerprints and inserts only distinct validated rows. Weekly reports count confirmed inserts recorded in this local work directory, not external database activity.
+
+Set request and monetary limits before execution. `AI_BUDGET_USD` defaults to 1.00 and `AI_COST_PER_REQUEST_USD` to a conservative 0.05 reservation per attempt. Set the latter to an upper bound appropriate to your configured model’s pricing and bounded input/output; it is a configured cost estimate, not live billing data. Every AI attempt, including retries, consumes a reservation and a request slot; output is capped at 4,096 tokens. SDK retries are disabled so only the adapter’s bounded retries apply. Search uses `BRAVE_SEARCH_BUDGET_USD` and `BRAVE_SEARCH_COST_PER_REQUEST_USD` (configure the latter for your plan; its zero default assumes no marginal charge). Search spend and attempts are persisted before requests. Budget exhaustion and service failures are errors, not successful planning artifacts.

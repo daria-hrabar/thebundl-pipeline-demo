@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 from typing import Sequence
 
 from .config import configuration_status, get_settings
-from .pipeline import weekly_report, write_run_artifact
+from .pipeline import weekly_report, execute_pipeline
 
 
 def _limit(value: str) -> int:
@@ -20,10 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m thebundl")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check-config", help="check settings without revealing values")
-    discover = commands.add_parser("discover", help="record a bounded source-discovery dry run")
+    discover = commands.add_parser("discover", help="discover sources and save local results")
     discover.add_argument("--dry-run", action="store_true", required=True)
     discover.add_argument("--limit", type=_limit, required=True, help="maximum source pages processed")
-    run = commands.add_parser("run", help="record a bounded pipeline run")
+    run = commands.add_parser("run", help="execute the bounded deal pipeline")
     mode = run.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--publish", action="store_true")
@@ -43,15 +44,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "report":
         path = weekly_report(settings, args.days)
-        print(f"Report written to {path}; distinct new deals: 0 (target: 10/week).")
+        count = json.loads(path.read_text())["distinct_new_deals"]
+        print(f"Report written to {path}; distinct new deals: {count} (target: 10/week).")
         return 0
     publish = bool(getattr(args, "publish", False))
-    if publish and not configuration_status(settings, publish=True)["publish_ready"]:
-        print("Publish config needs SUPABASE_URL and SUPABASE_KEY. No write occurred.")
-        return 2
-    path = write_run_artifact(settings, args.command, limit=args.limit, publish=publish)
-    print(f"{args.command} planning artifact written. No sources, deals, or Supabase writes occurred. Details: {path}")
-    return 3
+    path, result = execute_pipeline(settings, args.command, limit=args.limit, publish=publish)
+    print(f"{args.command} {result['status']}. " + "; ".join(
+        f"{key.replace('_', ' ')}: {value}" for key, value in result['counts'].items()))
+    for error in result['errors']:
+        print(f"Error in {error['stage']}: {error['message']}")
+    print(f"Details: {path}")
+    return 1 if result['status'] == 'failed' else 0
+
 
 
 if __name__ == "__main__":

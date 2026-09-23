@@ -110,10 +110,13 @@ class GroqExtractor(AIExtractor):
         if max_requests < 1:
             raise ValueError("max_requests must be at least 1")
         self.model = model
-        self.client = client or Groq(api_key=api_key)
+        self.client = client or Groq(api_key=api_key, max_retries=0, timeout=30.0)
         self.max_retries = max_retries
         self.max_requests = max_requests
         self.requests_used = 0
+        self.candidates_extracted = 0
+        self.candidates_rejected = 0
+        self.duplicates = 0
         self.sleep = sleep
 
     def extract(self, text: str, source_url: str) -> list[DealCandidate]:
@@ -125,12 +128,16 @@ class GroqExtractor(AIExtractor):
                     f"AI request limit reached ({self.max_requests}) before source {source_url} could be fully extracted"
                 )
             payload = self._extract_chunk(chunk, source_url, index)
+            self.candidates_extracted += len(payload.deals)
             for deal in payload.deals:
                 try:
                     candidates.append(self._validate_deal(deal, text, source_url))
                 except ExtractionError:
+                    self.candidates_rejected += 1
                     continue
-        return self._deduplicate(candidates)
+        unique = self._deduplicate(candidates)
+        self.duplicates += len(candidates) - len(unique)
+        return unique
 
     def _extract_chunk(self, chunk: str, source_url: str, index: int) -> ExtractionPayload:
         messages = [
@@ -150,7 +157,7 @@ class GroqExtractor(AIExtractor):
                 self.requests_used += 1
                 response = self.client.chat.completions.create(
                     model=self.model, messages=messages, response_format=response_format,
-                    include_reasoning=False,
+                    include_reasoning=False, max_completion_tokens=4096,
                 )
                 content = response.choices[0].message.content
                 if not content:

@@ -30,6 +30,47 @@ class Geocoder(Protocol):
     def lookup(self, address: str) -> list[GeocodeMatch]: ...
 
 
+class StructuredDataGeocoder:
+    """Resolve only a matching business/address/geo record in collected JSON-LD.
+
+    Missing or ambiguous records fail closed; model coordinates are never used.
+    """
+
+    def __init__(self, page: ExtractedPage, business_name: str) -> None:
+        self.data = page.structured_data
+        self.business_name = " ".join(business_name.casefold().split())
+
+    def lookup(self, address: str) -> list[GeocodeMatch]:
+        matches = set()
+        normalise = lambda value: " ".join(str(value).casefold().split())
+
+        def visit(node):
+            if isinstance(node, list):
+                for item in node:
+                    visit(item)
+            elif isinstance(node, dict):
+                branch, geo = node.get("address"), node.get("geo")
+                if (normalise(node.get("name", "")) == self.business_name
+                        and isinstance(branch, dict) and isinstance(geo, dict)):
+                    street = str(branch.get("streetAddress", ""))
+                    full = ", ".join(str(branch[key]) for key in
+                                     ("streetAddress", "addressLocality", "addressRegion", "postalCode")
+                                     if branch.get(key))
+                    if street and normalise(address) in {normalise(street), normalise(full)}:
+                        try:
+                            lat, lon = float(geo["latitude"]), float(geo["longitude"])
+                            if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+                                matches.add((lat, lon))
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                for value in node.values():
+                    if isinstance(value, (list, dict)):
+                        visit(value)
+
+        visit(self.data)
+        return [GeocodeMatch(address, lat, lon) for lat, lon in sorted(matches)]
+
+
 class CachedGeocoder:
     """File-backed cache around a rate-limited geocoder adapter."""
 
@@ -87,8 +128,14 @@ def validate_candidate(candidate: DealCandidate, page: ExtractedPage, *, geocode
     content = " ".join(page.text.split())
     evidence = " ".join(candidate.evidence_text.split())
     reasons: list[str] = []
-    if not evidence or evidence not in content:
+    excerpts = [" ".join(part.split()) for part in candidate.evidence_text.split("\n---\n") if part.strip()]
+    if not excerpts or any(part not in content for part in excerpts):
         reasons.append("evidence excerpt is absent from collected content")
+    if str(candidate.source_url) != str(page.source_url):
+        reasons.append("candidate source does not match collected page")
+    for value in (candidate.business_name, candidate.address, candidate.description):
+        if " ".join(value.split()) not in evidence:
+            reasons.append("business, branch, or offer is absent from evidence")
     if " ".join(candidate.address.split()) not in content:
         reasons.append("branch address is not source-backed")
     offer_text = f"{candidate.title} {candidate.description} {candidate.evidence_text}".casefold()

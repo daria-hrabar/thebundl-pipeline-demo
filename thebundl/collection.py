@@ -21,7 +21,7 @@ from .schemas import ExtractedPage, Source
 
 
 def extract_html(source: Source, html: str) -> ExtractedPage:
-    """Extract text, links, and JSON-LD only; fetching is added later."""
+    """Extract only text, links, and JSON-LD from collected HTML."""
     soup = BeautifulSoup(html, "html.parser")
     structured_data = []
     for node in soup.select('script[type="application/ld+json"]'):
@@ -74,24 +74,27 @@ def _fetch_html(url: str, client: httpx.Client, *, resolver: Callable[..., objec
         if not _public_host(current, resolver):
             return None, None, "unsafe destination"
         try:
-            response = client.get(current, follow_redirects=False)
+            # Inspect headers before reading a body, so media/PDF responses are
+            # closed without downloading their contents.
+            with client.stream("GET", current, follow_redirects=False) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        return None, None, "redirect without location"
+                    try:
+                        current = normalize_url(urljoin(current, location))
+                    except ValueError:
+                        return None, None, "unsafe redirect"
+                    continue
+                if response.status_code != 200:
+                    return None, None, f"HTTP {response.status_code}"
+                content_type = response.headers.get("content-type", "").split(";", 1)[0].casefold()
+                if content_type not in {"text/html", "application/xhtml+xml"}:
+                    return None, None, "unsupported content type (HTML required)"
+                response.read()
+                return response.text, normalize_url(str(response.url)), None
         except httpx.HTTPError as error:
             return None, None, f"request failed: {error.__class__.__name__}"
-        if response.is_redirect:
-            location = response.headers.get("location")
-            if not location:
-                return None, None, "redirect without location"
-            try:
-                current = normalize_url(urljoin(current, location))
-            except ValueError:
-                return None, None, "unsafe redirect"
-            continue
-        if response.status_code != 200:
-            return None, None, f"HTTP {response.status_code}"
-        content_type = response.headers.get("content-type", "").split(";", 1)[0].casefold()
-        if content_type not in {"text/html", "application/xhtml+xml"}:
-            return None, None, f"unsupported content type: {content_type or 'missing'}"
-        return response.text, normalize_url(str(response.url)), None
     return None, None, "too many redirects"
 
 
@@ -108,6 +111,8 @@ def collect_source(source: Source, *, client: httpx.Client, resolver: Callable[.
 
 def relevant_promotion_links(page: ExtractedPage, *, maximum: int = 5) -> list[str]:
     """Keep at most five same-site links likely to contain promotion details."""
+    if maximum <= 0:
+        return []
     origin = urlsplit(str(page.source_url)).hostname
     links: list[str] = []
     for link in page.links:

@@ -14,6 +14,8 @@ class Source(BaseModel):
     discovered_at: datetime
     campus: str
     priority: int = 0
+    last_collected_at: datetime | None = None
+    content_hash: str | None = None
 
 
 class ExtractedPage(BaseModel):

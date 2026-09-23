@@ -5,8 +5,14 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import Settings
+from .collection import CollectionResult, collect_sources
+from .discovery import SearchClient, discover_sources, discovery_due, known_sources
+
+if TYPE_CHECKING:
+    import httpx
 
 
 def write_run_artifact(settings: Settings, command: str, *, limit: int | None, publish: bool) -> Path:
@@ -29,3 +35,16 @@ def weekly_report(settings: Settings, days: int) -> Path:
     payload.update({"days": days, "distinct_new_deals": 0, "target_distinct_new_deals_per_week": 10})
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def collect_daily_sources(settings: Settings, *, client: "httpx.Client", limit: int,
+                          search_client: SearchClient | None = None) -> list[CollectionResult]:
+    """Discover only when due, then reuse all known sources for HTML collection.
+
+    This stops before AI extraction and publishing; callers decide those later
+    after validation and duplicate checks.
+    """
+    if discovery_due(settings):
+        discover_sources(settings, limit, search_client=search_client)
+    return collect_sources(known_sources(settings)[:limit], client=client,
+                           pace_seconds=settings.domain_pacing_seconds)

@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     ai_model: str = "openai/gpt-oss-20b"
     discovery_interval_days: int = Field(default=14, ge=1)
     collection_interval_hours: int = Field(default=24, ge=1)
+    brave_search_budget_usd: float = Field(default=5.0, ge=0)
+    brave_search_cost_per_request_usd: float = Field(default=0.0, ge=0)
+    http_timeout_seconds: float = Field(default=15.0, gt=0)
+    domain_pacing_seconds: float = Field(default=1.0, ge=0)
     work_dir: Path = Path("work")
     campuses: tuple[Campus, Campus] = (BARUCH_COLLEGE, COLUMBIA_UNIVERSITY)
 

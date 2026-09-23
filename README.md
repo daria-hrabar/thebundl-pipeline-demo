@@ -38,6 +38,15 @@ All command output is saved under ignored `work/`.
 Until pipeline stages are implemented, `discover` and `run` create an artifact,
 print their unfinished status, and exit with code 3.
 
+## Geocoding
+
+Branch lookup happens only after the collected page contains the address;
+coordinates emitted by an AI are never used. For this small, cached pipeline,
+use public OpenStreetMap Nominatim with an identifying User-Agent, no more than
+one request per second, and a persistent cache. Do not use its public service
+for bulk geocoding; use a provider-hosted service if volume exceeds those
+limits. Ambiguous or missing results are rejected.
+
 ## Current status
 
 This first step provides the package structure, configuration, schemas, CLI,

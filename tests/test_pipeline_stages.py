@@ -5,6 +5,8 @@ import httpx
 from thebundl.collection import collect_source, collect_sources, record_successful_processing, should_process_content, successful_content_hashes
 from thebundl.config import BARUCH_COLLEGE, COLUMBIA_UNIVERSITY, Settings
 from thebundl.deduplication import exact_duplicate
+import pytest
+
 from thebundl.discovery import discover_sources, discovery_due, discovery_queries, normalize_url
 from thebundl.schemas import DealCandidate, ExtractedPage, Source
 from thebundl.validation import GeocodeMatch, validate_candidate
@@ -44,6 +46,20 @@ def test_normalize_url_removes_only_tracking_parameters():
     assert normalize_url("https://EXAMPLE.test/branch?location=5&utm_source=x&gclid=y") == (
         "https://example.test/branch?location=5"
     )
+
+
+def test_discovery_respects_request_cap_and_reports_traceable_search_errors(tmp_path):
+    settings = Settings(work_dir=tmp_path, max_search_requests_per_run=1)
+    search = FixtureSearch()
+    discover_sources(settings, 10, search_client=search, now=NOW)
+    assert len(search.queries) == 1
+
+    class BrokenSearch:
+        def search(self, query, *, count):
+            raise RuntimeError("fixture outage")
+
+    with pytest.raises(RuntimeError, match="Source discovery failed for query"):
+        discover_sources(Settings(work_dir=tmp_path / "broken"), 10, search_client=BrokenSearch(), now=NOW)
 
 
 def test_collection_uses_html_fixture_and_follows_only_relevant_same_site_links():

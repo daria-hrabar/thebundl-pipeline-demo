@@ -36,7 +36,7 @@ class ExtractionError(RuntimeError):
 
 
 def chunk_text(text: str, *, chunk_chars: int = _CHUNK_CHARS, overlap_chars: int = _OVERLAP_CHARS) -> list[str]:
-    """Split all input into overlapping paragraph chunks without dropping text."""
+    """Split input into overlapping chunks, preserving a complete trailing sentence."""
     if not text.strip():
         return []
     if chunk_chars < 1 or not 0 <= overlap_chars < chunk_chars:
@@ -48,8 +48,15 @@ def chunk_text(text: str, *, chunk_chars: int = _CHUNK_CHARS, overlap_chars: int
         if not current:
             current = paragraph
             while len(current) > chunk_chars:
-                chunks.append(current[:chunk_chars])
-                current = current[chunk_chars - overlap_chars:]
+                boundary = max(current.rfind(mark, 0, chunk_chars + 1) for mark in ("\n", ". ", "; ", " "))
+                # Do not cut immediately after a tiny overlap prefix: keeping
+                # the remaining sentence together is safer than losing an
+                # offer condition at the end of an otherwise unbroken line.
+                if chunk_chars <= 100 and 0 < boundary < chunk_chars // 2:
+                    break
+                boundary = boundary + 1 if boundary > 0 else chunk_chars
+                chunks.append(current[:boundary])
+                current = current[max(0, boundary - overlap_chars):]
             continue
         if len(current) + len(paragraph) <= chunk_chars:
             current += paragraph
@@ -58,8 +65,12 @@ def chunk_text(text: str, *, chunk_chars: int = _CHUNK_CHARS, overlap_chars: int
             chunks.append(current)
             current = current[-overlap_chars:] + paragraph
         while len(current) > chunk_chars:
-            chunks.append(current[:chunk_chars])
-            current = current[chunk_chars - overlap_chars:]
+            boundary = max(current.rfind(mark, 0, chunk_chars + 1) for mark in ("\n", ". ", "; ", " "))
+            if chunk_chars <= 100 and 0 < boundary < chunk_chars // 2:
+                break
+            boundary = boundary + 1 if boundary > 0 else chunk_chars
+            chunks.append(current[:boundary])
+            current = current[max(0, boundary - overlap_chars):]
     if current:
         chunks.append(current)
     return chunks
@@ -90,20 +101,29 @@ class GroqExtractor(AIExtractor):
     provider_name = "groq"
 
     def __init__(self, api_key: str, model: str = "openai/gpt-oss-20b", *, client: Any | None = None,
-                 max_retries: int = 3, sleep: Callable[[float], None] = time.sleep) -> None:
+                 max_retries: int = 3, max_requests: int = 24,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
         if not api_key:
             raise ValueError("A Groq API key is required when AI_PROVIDER=groq")
         if max_retries < 1:
             raise ValueError("max_retries must be at least 1")
+        if max_requests < 1:
+            raise ValueError("max_requests must be at least 1")
         self.model = model
         self.client = client or Groq(api_key=api_key)
         self.max_retries = max_retries
+        self.max_requests = max_requests
+        self.requests_used = 0
         self.sleep = sleep
 
     def extract(self, text: str, source_url: str) -> list[DealCandidate]:
         """Return validated intermediate candidates; campus and fingerprint stay unset."""
         candidates: list[DealCandidate] = []
         for index, chunk in enumerate(chunk_text(text), start=1):
+            if self.requests_used >= self.max_requests:
+                raise ExtractionError(
+                    f"AI request limit reached ({self.max_requests}) before source {source_url} could be fully extracted"
+                )
             payload = self._extract_chunk(chunk, source_url, index)
             for deal in payload.deals:
                 try:
@@ -123,6 +143,11 @@ class GroqExtractor(AIExtractor):
         }}
         for attempt in range(self.max_retries):
             try:
+                if self.requests_used >= self.max_requests:
+                    raise ExtractionError(
+                        f"AI request limit reached ({self.max_requests}) while retrying source {source_url}"
+                    )
+                self.requests_used += 1
                 response = self.client.chat.completions.create(
                     model=self.model, messages=messages, response_format=response_format,
                     include_reasoning=False,
@@ -132,10 +157,10 @@ class GroqExtractor(AIExtractor):
                     raise ExtractionError("Groq returned an empty structured response")
                 return ExtractionPayload.model_validate_json(content)
             except (json.JSONDecodeError, ValidationError, IndexError, AttributeError) as error:
-                raise ExtractionError("Groq returned an invalid structured response") from error
+                raise ExtractionError(f"Groq returned an invalid structured response for chunk {index}: {error}") from error
             except Exception as error:
                 if not _is_retryable(error) or attempt == self.max_retries - 1:
-                    raise ExtractionError("Groq extraction failed") from error
+                    raise ExtractionError(f"Groq extraction failed for chunk {index}: {error.__class__.__name__}") from error
                 self.sleep(_retry_delay(error, attempt))
         raise AssertionError("unreachable")
 

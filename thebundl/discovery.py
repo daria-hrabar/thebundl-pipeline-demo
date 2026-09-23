@@ -110,6 +110,8 @@ def discover_sources(settings: Settings, limit: int, *, search_client: SearchCli
     """Discover normalized source leads without fetching, extraction, or publishing."""
     if limit < 1:
         return []
+    if not discovery_due(settings, now=now):
+        return []
     if search_client is None:
         if settings.brave_search_api_key is None:
             raise RuntimeError("BRAVE_SEARCH_API_KEY is required for discovery")
@@ -117,10 +119,18 @@ def discover_sources(settings: Settings, limit: int, *, search_client: SearchCli
     ledger = _load_ledger(settings)
     spend, timestamp = float(ledger.get("search_spend_usd", 0.0)), now or datetime.now(UTC)
     leads: list[Source] = []
+    requests_used = 0
     for campus, query in discovery_queries():
+        if requests_used >= settings.max_search_requests_per_run:
+            break
         if spend + settings.brave_search_cost_per_request_usd > settings.brave_search_budget_usd:
             break
-        for result in search_client.search(query, count=min(limit, 20)):
+        try:
+            results = search_client.search(query, count=min(limit, 20))
+        except Exception as error:
+            raise RuntimeError(f"Source discovery failed for query {query!r}: {error.__class__.__name__}") from error
+        requests_used += 1
+        for result in results:
             try:
                 title = result.get("title", "")
                 leads.append(Source(url=normalize_url(result["url"]), title=title, discovered_at=timestamp,
@@ -129,7 +139,8 @@ def discover_sources(settings: Settings, limit: int, *, search_client: SearchCli
             except (KeyError, ValueError):
                 continue
         spend += settings.brave_search_cost_per_request_usd
-    _save_ledger(settings, {"search_spend_usd": spend, "last_discovery_at": timestamp.isoformat()})
+    _save_ledger(settings, {"search_spend_usd": spend, "last_discovery_at": timestamp.isoformat(),
+                            "last_requests_used": requests_used})
     sources = deduplicate_sources(known_sources(settings) + leads)
     _save_sources(settings, sources)
     return sorted(deduplicate_sources(leads), key=lambda source: source.priority, reverse=True)[:limit]

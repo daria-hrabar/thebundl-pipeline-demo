@@ -63,6 +63,25 @@ def test_invalid_structured_response_is_rejected():
         GroqExtractor("test-key", client=client).extract(PAGE, "https://example.test/deals")
 
 
+@pytest.mark.parametrize("payload", [
+    {"deals": [{**DEAL, "unexpected": "field"}]},
+    {"deals": [{**DEAL, "restrictions": 12}]},
+    {"deals": "not a list"},
+])
+def test_malformed_full_or_partial_structured_output_is_rejected(payload):
+    client, _ = mock_client(json.dumps(payload))
+
+    with pytest.raises(ExtractionError, match="invalid structured response"):
+        GroqExtractor("test-key", client=client).extract(PAGE, "https://example.test/deals")
+
+
+def test_semantically_unsupported_deal_is_not_returned():
+    unsupported = {**DEAL, "description": "50% off dinner", "evidence_text": PAGE}
+    client, _ = mock_client(json.dumps({"deals": [unsupported]}))
+
+    assert GroqExtractor("test-key", client=client).extract(PAGE, "https://example.test/deals") == []
+
+
 def test_rate_limit_is_retried_with_bounded_attempts():
     error = type("RateLimitError", (Exception,), {"status_code": 429})()
     client, completions = mock_client(error, error, json.dumps({"deals": []}))
@@ -96,3 +115,12 @@ def test_chunking_keeps_the_end_of_a_long_offer_condition():
     chunks = chunk_text(text, chunk_chars=20, overlap_chars=5)
 
     assert chunks[-1].endswith("promotion valid through September 30")
+
+
+def test_ai_request_cap_prevents_an_unbounded_number_of_mock_calls():
+    text = "first offer. " + ("word " * 2_500) + "second offer."
+    client, completions = mock_client(json.dumps({"deals": []}))
+
+    with pytest.raises(ExtractionError, match="AI request limit reached \(1\)"):
+        GroqExtractor("test-key", client=client, max_requests=1).extract(text, "https://example.test/deals")
+    assert len(completions.calls) == 1

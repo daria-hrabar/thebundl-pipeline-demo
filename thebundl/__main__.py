@@ -20,10 +20,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m thebundl")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check-config", help="check settings without revealing values")
-    discover = commands.add_parser("discover", help="discover sources (not implemented)")
+    discover = commands.add_parser("discover", help="record a bounded source-discovery dry run")
     discover.add_argument("--dry-run", action="store_true", required=True)
     discover.add_argument("--limit", type=_limit, required=True, help="maximum source pages processed")
-    run = commands.add_parser("run", help="discover when due, then collect (not implemented)")
+    run = commands.add_parser("run", help="record a bounded pipeline run")
     mode = run.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--publish", action="store_true")
@@ -50,7 +50,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Publish config needs SUPABASE_URL and SUPABASE_KEY. No write occurred.")
         return 2
     path = write_run_artifact(settings, args.command, limit=args.limit, publish=publish)
-    print(f"{args.command} is not implemented. No Supabase writes occurred. Details: {path}")
+    print(f"{args.command} planning artifact written. No sources, deals, or Supabase writes occurred. Details: {path}")
     return 3
 
 

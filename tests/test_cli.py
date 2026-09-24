@@ -6,7 +6,7 @@ import pytest
 
 from thebundl.__main__ import main
 from thebundl.config import Settings
-from thebundl import collection, discovery, pipeline, storage
+from thebundl import collection, discovery, pipeline, storage, observability
 
 PAGE = 'Bite Cafe, 55 Lexington Ave: 20% off lunch through September 30. Dine-in only.'
 DEAL = dict(business_name='Bite Cafe', address='55 Lexington Ave', title='20% off lunch',
@@ -17,12 +17,14 @@ GEO = {'@type': 'Restaurant', 'name': 'Bite Cafe', 'address': {'streetAddress': 
 
 @pytest.fixture
 def services(monkeypatch, tmp_path):
+    monkeypatch.setattr(observability, 'ERROR_LOG', tmp_path / 'errors.txt')
+    monkeypatch.setattr('thebundl.__main__.ERROR_LOG', tmp_path / 'errors.txt')
     settings = Settings(_env_file=None, work_dir=tmp_path, brave_search_api_key='secret-search',
                         groq_api_key='secret-ai', supabase_url='https://test.invalid',
                         supabase_key='secret-db', max_search_requests_per_run=1, domain_pacing_seconds=0)
     monkeypatch.setattr('thebundl.__main__.get_settings', lambda: settings)
     calls = SimpleNamespace(search=0, pages=0, ai=0, inserts=[], existing=set(),
-                            fail=None, deals=[DEAL], geo=GEO, sources=1)
+                            source_rows=[], fail=None, deals=[DEAL], geo=GEO, sources=1)
 
     def search(self, query, *, count):
         calls.search += 1
@@ -67,6 +69,12 @@ def services(monkeypatch, tmp_path):
             assert all(set(row) == {'fingerprint', 'title', 'business_name', 'source_url', 'evidence'} for row in rows)
             self.rows = rows
             return self
+        def upsert(self, rows, **kwargs):
+            if calls.fail == 'sources':
+                raise RuntimeError('secret-db')
+            calls.source_rows.extend(rows)
+            self.rows = []
+            return self
         def execute(self):
             if calls.fail == 'db' or (calls.fail == 'insert' and self.rows is not None):
                 raise RuntimeError('secret-db')
@@ -76,14 +84,16 @@ def services(monkeypatch, tmp_path):
             calls.existing.update(row['fingerprint'] for row in self.rows)
             return SimpleNamespace(data=self.rows)
     def table(name):
-        assert name == 'pipeline_deals'
+        assert name in {'pipeline_deals', 'pipeline_sources'}
         return Table()
     monkeypatch.setattr(storage, '_client', lambda settings: SimpleNamespace(table=table))
     return calls, settings
 
 
 def artifact(settings, command='run'):
-    return json.loads(sorted(settings.work_dir.glob(f'*-{command}.json'))[-1].read_text())
+    records = [json.loads(path.read_text()) for path in settings.work_dir.glob('*.json')]
+    return max((record for record in records if isinstance(record, dict)
+                and record.get('command') == command), key=lambda record: record['timestamp'])
 
 
 def test_check_config_does_not_print_secret(services, capsys):
@@ -193,11 +203,11 @@ def test_dry_run_without_database_credentials(services, monkeypatch):
     assert artifact(settings)['accepted'] and not calls.inserts
 
 
-def test_daily_failure_does_not_refetch(services):
+def test_publish_daily_failure_does_not_refetch(services):
     calls, settings = services
     calls.fail = 'http'
-    assert main(['run', '--dry-run', '--limit', '5']) == 1
-    assert main(['run', '--dry-run', '--limit', '5']) == 1
+    assert main(['run', '--publish', '--limit', '5']) == 1
+    assert main(['run', '--publish', '--limit', '5']) == 1
     assert calls.pages == 1
 
 
@@ -207,3 +217,106 @@ def test_out_of_range_branch_is_rejected(services):
     assert main(['run', '--publish', '--limit', '5']) == 0
     assert artifact(settings)['counts']['candidates_rejected'] == 1
     assert not calls.inserts
+
+
+def test_dry_run_retries_failed_collection_immediately(services):
+    calls, settings = services
+    calls.fail = 'http'
+    assert main(['run', '--publish', '--limit', '5']) == 1
+    calls.fail = None
+    assert main(['run', '--dry-run', '--limit', '5']) == 0
+    assert calls.pages == 2 and calls.ai == 1
+    assert main(['run', '--dry-run', '--limit', '5']) == 0
+    assert calls.pages == 2 and calls.ai == 2
+    assert not calls.inserts and not calls.source_rows
+
+
+def test_source_staging_and_publication(services):
+    calls, settings = services
+    assert main(['discover', '--dry-run', '--limit', '5']) == 0
+    staged = json.loads((settings.work_dir / 'known-sources.json').read_text())
+    assert staged[0]['title'] == 'Lunch deals'
+    assert not calls.source_rows
+    assert main(['run', '--publish', '--limit', '5']) == 0
+    assert calls.source_rows == [dict(canonical_url=staged[0]['url'], title=staged[0]['title'],
+                                    first_seen_at=staged[0]['discovered_at'].replace('Z', '+00:00'))]
+
+
+def test_error_log_and_live_progress(services, capsys):
+    calls, settings = services
+    calls.fail = 'ai'
+    assert main(['run', '--dry-run', '--limit', '5']) == 1
+    logs = [json.loads(line) for line in observability.ERROR_LOG.read_text().splitlines()]
+    assert all(item['date'] and item['error_type'] and item['description'] for item in logs)
+    assert any(item['stage'] == 'extraction' for item in logs)
+    assert 'secret-' not in observability.ERROR_LOG.read_text()
+    events = capsys.readouterr().err
+    assert 'Search API: request started' in events
+    assert 'Search API: response received' in events
+    assert 'AI API chunk 1' in events
+    assert 'Saved' in events
+    assert not calls.source_rows
+
+
+def test_configuration_failure_logged_without_secrets(services, monkeypatch):
+    def broken():
+        raise ValueError('secret-config')
+    monkeypatch.setattr('thebundl.__main__.get_settings', broken)
+    assert main(['check-config']) == 1
+    log = observability.ERROR_LOG.read_text()
+    assert 'ValueError' in log and 'secret-config' not in log
+
+
+def test_source_publication_failure_can_be_retried(services):
+    calls, settings = services
+    calls.fail = 'sources'
+    assert main(['run', '--publish', '--limit', '5']) == 1
+    assert artifact(settings)['counts']['deals_inserted'] == 1
+    assert artifact(settings)['errors'][0]['stage'] == 'source publication'
+    calls.fail = None
+    assert main(['run', '--publish', '--limit', '5']) == 0
+    assert len(calls.inserts) == 1 and len(calls.source_rows) == 1
+
+
+def test_rejected_sources_stay_local(services):
+    calls, settings = services
+    calls.geo = {}
+    assert main(['run', '--publish', '--limit', '5']) == 0
+    assert not calls.source_rows
+    assert (settings.work_dir / 'known-sources.json').exists()
+
+
+def test_readable_artifact_names_preserve_repeated_runs(tmp_path):
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 9, 23, tzinfo=UTC)
+    for process in ('discovery', 'extraction', 'report'):
+        first = pipeline.artifact_path(tmp_path, now, process)
+        assert first.name == f'9-23-{process}.json'
+        first.write_text('{}')
+        second = pipeline.artifact_path(tmp_path, now, process)
+        assert second.name == f'9-23-{process}-2.json'
+        second.write_text('{}')
+        assert pipeline.artifact_path(tmp_path, now, process).name == f'9-23-{process}-3.json'
+        assert first.read_text() == '{}'
+
+
+def test_report_counts_legacy_and_new_extraction_names(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    for filename, count, timestamp in (
+        ('20260923T190000Z-run.json', 1, now),
+        ('9-24-extraction.json', 2, now),
+        ('9-24-extraction-2.json', 3, now),
+        ('9-1-extraction.json', 8, now - timedelta(days=30)),
+    ):
+        (tmp_path / filename).write_text(json.dumps(dict(
+            timestamp=timestamp.isoformat(), command='run', counts={'deals_inserted': count})))
+    settings = Settings(_env_file=None, work_dir=tmp_path)
+    first = pipeline.weekly_report(settings, 7)
+    second = pipeline.weekly_report(settings, 7)
+    assert first.name == f'{now.month}-{now.day}-report.json'
+    assert second.name == f'{now.month}-{now.day}-report-2.json'
+    assert json.loads(first.read_text())['distinct_new_deals'] == 6
+    assert json.loads(second.read_text())['distinct_new_deals'] == 6

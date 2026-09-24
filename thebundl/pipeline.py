@@ -15,7 +15,8 @@ from .config import Settings
 from .deduplication import exact_duplicate
 from .discovery import discover_sources, discovery_due, known_sources
 from .schemas import ExtractedPage
-from .storage import existing_fingerprints, publish_candidates
+from .storage import existing_fingerprints, publish_candidates, publish_sources
+from .observability import progress, record_error
 from .validation import StructuredDataGeocoder, validate_candidate
 
 
@@ -24,10 +25,22 @@ def _write(path: Path, payload: dict) -> None:
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
     temporary.replace(path)
+    progress(f"Saved {path}")
 
 
 def _read(path: Path) -> dict:
     return json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+
+
+def artifact_path(work_dir: Path, now: datetime, process: str) -> Path:
+    """Readable UTC dates; retain repeated runs instead of overwriting them."""
+    stem = f'{now.month}-{now.day}-{process}'
+    path = work_dir / f'{stem}.json'
+    sequence = 2
+    while path.exists():
+        path = work_dir / f'{stem}-{sequence}.json'
+        sequence += 1
+    return path
 
 
 def make_extractor(settings: Settings):
@@ -46,7 +59,8 @@ def make_extractor(settings: Settings):
 
 def execute_pipeline(settings: Settings, command: str, *, limit: int | None, publish: bool) -> tuple[Path, dict]:
     now = datetime.now(UTC)
-    path = settings.work_dir / f'{now:%Y%m%dT%H%M%S%fZ}-{command}.json'
+    process = {'discover': 'discovery', 'run': 'extraction'}[command]
+    path = artifact_path(settings.work_dir, now, process)
     counts = dict.fromkeys(('sources_found', 'pages_fetched', 'pages_reused', 'candidates_extracted',
                             'candidates_rejected', 'duplicates', 'deals_inserted'), 0)
     payload = {'timestamp': now.isoformat(), 'command': command, 'limit': limit,
@@ -62,27 +76,31 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
         found = discover_sources(settings, limit) if due else []
         counts['sources_found'] = len(found)
         payload['discovery_status'] = 'executed' if due else 'not_due'
+        progress(f"Discovery: {payload['discovery_status']}; source staging file: {settings.work_dir / 'known-sources.json'}")
         sources = sorted(known_sources(settings), key=lambda source: source.priority, reverse=True)[:limit]
         payload['sources'] = [source.model_dump(mode='json') for source in sources]
         if command == 'run':
             stage = 'extraction configuration'
             extractor = make_extractor(settings)
             accepted = []
+            successful_sources = []
             state_path = settings.work_dir / 'collection-state.json'
             state = _read(state_path)
             last_fetch = {}
             with httpx.Client(timeout=settings.http_timeout_seconds) as client:
-                for source in sources:
+                for source_index, source in enumerate(sources, start=1):
                     url = str(source.url)
                     stage = 'collection'
                     entry = state.get(url)
-                    if entry and now - datetime.fromisoformat(entry['attempted_at']) < timedelta(hours=settings.collection_interval_hours):
+                    progress(f'Processing source {source_index}/{len(sources)}')
+                    if entry and (entry.get('page') or publish) and now - datetime.fromisoformat(entry['attempted_at']) < timedelta(hours=settings.collection_interval_hours):
                         if not entry.get('page'):
-                            payload['errors'].append({'stage': stage, 'source_url': url,
+                            payload['errors'].append({'stage': stage, 'error_type': 'CollectionIntervalError', 'source_url': url,
                                                       'message': 'Previous collection failed; next attempt allowed after daily interval'})
                             continue
                         page = ExtractedPage.model_validate(entry['page'])
                         counts['pages_reused'] += 1
+                        progress('Reusing cached HTML; extraction will run again')
                     else:
                         state[url] = {'attempted_at': now.isoformat(), 'page': None}
                         _write(state_path, state)  # Reserve the daily attempt before network I/O.
@@ -94,7 +112,7 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                                                  pace_seconds=settings.domain_pacing_seconds)[0]
                         last_fetch[domain] = time.monotonic()
                         if result.page is None:
-                            payload['errors'].append({'stage': stage, 'source_url': url, 'message': result.reason})
+                            payload['errors'].append({'stage': stage, 'error_type': 'CollectionError', 'source_url': url, 'message': result.reason})
                             continue
                         page = result.page
                         counts['pages_fetched'] += 1
@@ -106,7 +124,7 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                     try:
                         candidates = extractor.extract(page.text, str(page.source_url))
                     except Exception as error:
-                        payload['errors'].append({'stage': stage, 'source_url': url,
+                        payload['errors'].append({'stage': stage, 'error_type': type(error).__name__, 'source_url': url,
                                                   'message': f'{type(error).__name__}; check AI credentials, model, service availability and request budget'})
                         continue
                     finally:
@@ -114,6 +132,8 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                         payload['ai_reserved_cost_usd'] = payload['ai_requests_used'] * settings.ai_cost_per_request_usd
                         for key, value in before.items():
                             counts[key] += getattr(extractor, key, 0) - value
+                    successful_sources.append(source.model_copy(update={"url": page.source_url}))
+                    progress(f'Extraction returned {len(candidates)} candidates; validating evidence and location')
                     if not hasattr(extractor, 'candidates_extracted'):
                         counts['candidates_extracted'] += len(candidates)
                     for candidate in candidates:
@@ -128,6 +148,7 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                         else:
                             accepted.append(result.candidate)
             payload['accepted'] = [deal.model_dump(mode='json') for deal in accepted]
+            validated_urls = {str(deal.source_url) for deal in accepted}
             stage = 'duplicate lookup'
             # Dry runs may read existing fingerprints when test credentials are present.
             if accepted and settings.supabase_url and settings.supabase_key is not None:
@@ -135,10 +156,13 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                 counts['duplicates'] += sum(deal.fingerprint in existing for deal in accepted)
                 accepted = [deal for deal in accepted if deal.fingerprint not in existing]
             payload['accepted'] = [deal.model_dump(mode='json') for deal in accepted]
-            if publish:
+            if publish and not payload['errors']:
                 stage = 'publication'
                 counts['deals_inserted'] = publish_candidates(settings, accepted)
                 counts['duplicates'] += len(accepted) - counts['deals_inserted']
+                stage = 'source publication'
+                payload['sources_published'] = publish_sources(settings, [source for source in successful_sources
+                    if str(source.url) in validated_urls])
         payload['status'] = 'failed' if payload['errors'] else 'completed'
     except Exception as error:
         # Provider exception bodies can contain credentials or request headers.
@@ -146,19 +170,25 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                  'extraction configuration': 'check AI_PROVIDER, GROQ_API_KEY and AI budget',
                  'configuration': 'check test SUPABASE_URL and SUPABASE_KEY',
                  'duplicate lookup': 'check test Supabase access and pipeline_deals schema',
+                 'source publication': 'check test Supabase insert permissions and pipeline_sources schema; rerun publication to retry missing source records',
                  'publication': 'check test Supabase insert permissions and pipeline_deals schema; an interrupted insert may have an unknown outcome'}
-        payload['errors'].append({'stage': stage, 'message': f'{type(error).__name__}; {hints.get(stage, "check local state and stage configuration")}'})
+        payload['errors'].append({'stage': stage, 'error_type': type(error).__name__, 'message': f'{type(error).__name__}; {hints.get(stage, "check local state and stage configuration")}'})
         payload['status'] = 'failed'
+    for error in payload['errors']:
+        record_error(error['stage'], error['error_type'], error['message'])
     _write(path, payload)
     return path, payload
 
 
 def weekly_report(settings: Settings, days: int) -> Path:
     now = datetime.now(UTC)
-    records = [_read(path) for path in settings.work_dir.glob('*-run.json')]
+    paths = set(settings.work_dir.glob('*-run.json'))
+    paths.update(settings.work_dir.glob('*-extraction.json'))
+    paths.update(settings.work_dir.glob('*-extraction-*.json'))
+    records = [_read(path) for path in paths]
     records = [record for record in records if datetime.fromisoformat(record['timestamp']) >= now - timedelta(days=days)]
     count = sum(record.get('counts', {}).get('deals_inserted', 0) for record in records)
-    path = settings.work_dir / f'{now:%Y%m%dT%H%M%S%fZ}-report.json'
+    path = artifact_path(settings.work_dir, now, 'report')
     _write(path, {'timestamp': now.isoformat(), 'status': 'completed', 'days': days,
                   'distinct_new_deals': count, 'target_distinct_new_deals_per_week': 10,
                   'scope': 'confirmed inserts recorded in this local work directory'})

@@ -11,6 +11,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from .config import Settings
+from .observability import progress, request_event
 from .deduplication import deduplicate_sources
 from .schemas import Source
 
@@ -130,7 +131,8 @@ def discover_sources(settings: Settings, limit: int, *, search_client: SearchCli
         _save_ledger(settings, {"search_spend_usd": spend, "last_discovery_at": timestamp.isoformat(),
                                 "last_requests_used": requests_used})
         try:
-            results = search_client.search(query, count=min(limit, 20))
+            with request_event("Search API"):
+                results = search_client.search(query, count=min(limit, 20))
         except Exception as error:
             raise RuntimeError(f"Source discovery failed for query {query!r}: {error.__class__.__name__}") from error
         for result in results:
@@ -148,4 +150,5 @@ def discover_sources(settings: Settings, limit: int, *, search_client: SearchCli
     leads = sorted(deduplicate_sources(leads), key=lambda source: source.priority, reverse=True)[:limit]
     sources = deduplicate_sources(known_sources(settings) + leads)
     _save_sources(settings, sources)
+    progress(f"Saved {len(sources)} discovered sources to {_sources_path(settings)} (local staging)")
     return sorted(deduplicate_sources(leads), key=lambda source: source.priority, reverse=True)[:limit]

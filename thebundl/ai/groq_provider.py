@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from thebundl.schemas import DealCandidate, ExtractedDeal, ExtractionPayload
 
 from .base import AIExtractor
+from ..observability import request_event, progress
 
 _CHUNK_CHARS = 12_000
 _OVERLAP_CHARS = 1_500
@@ -155,10 +156,11 @@ class GroqExtractor(AIExtractor):
                         f"AI request limit reached ({self.max_requests}) while retrying source {source_url}"
                     )
                 self.requests_used += 1
-                response = self.client.chat.completions.create(
-                    model=self.model, messages=messages, response_format=response_format,
-                    include_reasoning=False, max_completion_tokens=4096,
-                )
+                with request_event(f"AI API chunk {index}, attempt {attempt + 1}, request {self.requests_used}/{self.max_requests}"):
+                    response = self.client.chat.completions.create(
+                        model=self.model, messages=messages, response_format=response_format,
+                        include_reasoning=False, max_completion_tokens=4096,
+                    )
                 content = response.choices[0].message.content
                 if not content:
                     raise ExtractionError("Groq returned an empty structured response")
@@ -168,6 +170,7 @@ class GroqExtractor(AIExtractor):
             except Exception as error:
                 if not _is_retryable(error) or attempt == self.max_retries - 1:
                     raise ExtractionError(f"Groq extraction failed for chunk {index}: {error.__class__.__name__}") from error
+                progress("AI API: waiting before bounded retry")
                 self.sleep(_retry_delay(error, attempt))
         raise AssertionError("unreachable")
 

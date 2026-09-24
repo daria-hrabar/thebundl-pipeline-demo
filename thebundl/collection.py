@@ -17,6 +17,7 @@ import httpx
 
 from .discovery import normalize_url
 from .config import Settings
+from .observability import request_event
 from .schemas import ExtractedPage, Source
 
 
@@ -76,7 +77,7 @@ def _fetch_html(url: str, client: httpx.Client, *, resolver: Callable[..., objec
         try:
             # Inspect headers before reading a body, so media/PDF responses are
             # closed without downloading their contents.
-            with client.stream("GET", current, follow_redirects=False) as response:
+            with request_event("HTML fetch"), client.stream("GET", current, follow_redirects=False) as response:
                 if response.is_redirect:
                     location = response.headers.get("location")
                     if not location:

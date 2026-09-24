@@ -6,6 +6,7 @@ import argparse
 import json
 from typing import Sequence
 
+from .observability import ERROR_LOG, progress, record_error
 from .config import configuration_status, get_settings
 from .pipeline import weekly_report, execute_pipeline
 
@@ -34,8 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    progress(f"{args.command}: started")
+    ERROR_LOG.touch(exist_ok=True)
     settings = get_settings()
     if args.command == "check-config":
         for key, present in configuration_status(settings).items():
@@ -55,6 +58,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Error in {error['stage']}: {error['message']}")
     print(f"Details: {path}")
     return 1 if result['status'] == 'failed' else 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except SystemExit as error:
+        if error.code:
+            record_error('arguments', 'ArgumentError', 'Invalid command arguments; use --help.')
+        raise
+    except Exception as error:
+        record_error('command', type(error).__name__,
+                     'Command failed; check configuration, local JSON files and filesystem permissions.')
+        return 1
 
 
 

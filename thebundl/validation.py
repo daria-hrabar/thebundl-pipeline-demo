@@ -123,7 +123,7 @@ def prepare_for_insertion(candidate: DealCandidate, *, latitude: float, longitud
 
 
 def validate_candidate(candidate: DealCandidate, page: ExtractedPage, *, geocoder: Geocoder,
-                       campuses: tuple[Campus, ...]) -> ValidationResult:
+                       campuses: tuple[Campus, ...], chain_branch: bool = False) -> ValidationResult:
     """Accept only source-evidenced, promotional, uniquely resolved branches."""
     content = " ".join(page.text.split())
     evidence = " ".join(candidate.evidence_text.split())
@@ -133,10 +133,12 @@ def validate_candidate(candidate: DealCandidate, page: ExtractedPage, *, geocode
         reasons.append("evidence excerpt is absent from collected content")
     if str(candidate.source_url) != str(page.source_url):
         reasons.append("candidate source does not match collected page")
-    for value in (candidate.business_name, candidate.address, candidate.description):
+    separate_branch = chain_branch and chain_wide_offer(candidate.evidence_text)
+    required_values = (candidate.business_name, candidate.description) if separate_branch else (candidate.business_name, candidate.address, candidate.description)
+    for value in required_values:
         if " ".join(value.split()) not in evidence:
             reasons.append("business, branch, or offer is absent from evidence")
-    if " ".join(candidate.address.split()) not in content:
+    if not separate_branch and " ".join(candidate.address.split()) not in content:
         reasons.append("branch address is not source-backed")
     offer_text = f"{candidate.title} {candidate.description} {candidate.evidence_text}".casefold()
     if not any(marker in offer_text for marker in _PROMOTION_WORDS):
@@ -163,3 +165,55 @@ def _distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     delta_phi, delta_lambda = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
     a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
     return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def chain_wide_offer(evidence: str) -> bool:
+    """Require explicit universal scope; participating/excluded branches are ambiguous."""
+    text = ' '.join(evidence.casefold().split())
+    return bool(re.search(r'\b(?:at|across|in) all (?:of our |our )?(?:locations|stores|restaurants)\b', text)) and not re.search(
+        r'\b(?:participating|selected|select locations|excluding|except|not valid|not available)\b', text)
+
+
+def validate_with_branch_pages(candidate: DealCandidate, page: ExtractedPage,
+                               branch_pages: list[ExtractedPage], campuses: tuple[Campus, ...]) -> list[ValidationResult]:
+    """Reuse collected branch JSON-LD; never infer chain applicability or coordinates."""
+    pages = [page, *branch_pages]
+    combined = page.model_copy(update={'structured_data': [record for item in pages for record in item.structured_data]})
+    resolver = StructuredDataGeocoder(combined, candidate.business_name)
+    if candidate.address.strip():
+        result = validate_candidate(candidate, page, geocoder=resolver, campuses=campuses)
+        if result.accepted:
+            result.branch_evidence_urls = sorted({str(item.source_url) for item in pages
+                if StructuredDataGeocoder(item, candidate.business_name).lookup(candidate.address)})
+        return [result]
+    if not chain_wide_offer(candidate.evidence_text):
+        return [ValidationResult(candidate=candidate, accepted=False, reasons=['explicit all-location applicability is missing'])]
+
+    addresses: set[str] = set()
+    def visit(node):
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+        elif isinstance(node, dict):
+            if (' '.join(str(node.get('name', '')).casefold().split()) ==
+                    ' '.join(candidate.business_name.casefold().split())):
+                address = node.get('address')
+                if isinstance(address, dict) and address.get('streetAddress'):
+                    addresses.add(str(address['streetAddress']))
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    visit(value)
+    visit(combined.structured_data)
+    results = []
+    for address in sorted(addresses):
+        matches = resolver.lookup(address)
+        if len(matches) != 1 or campus_for_location(matches[0].latitude, matches[0].longitude, campuses) is None:
+            continue
+        branch = candidate.model_copy(update={'address': address})
+        # Offer evidence stays untouched; branch evidence is independently retained.
+        result = validate_candidate(branch, page, geocoder=resolver, campuses=campuses, chain_branch=True)
+        result.branch_evidence_urls = sorted({str(item.source_url) for item in pages
+            if StructuredDataGeocoder(item, candidate.business_name).lookup(address)})
+        results.append(result)
+    return results or [ValidationResult(candidate=candidate, accepted=False,
+        reasons=['no unambiguous verified nearby branch found in collected branch data'])]

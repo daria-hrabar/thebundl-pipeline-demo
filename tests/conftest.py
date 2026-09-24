@@ -11,3 +11,9 @@ def forbid_network(monkeypatch):
     monkeypatch.setattr(socket.socket, 'connect', blocked)
     monkeypatch.setattr(socket.socket, 'connect_ex', blocked)
     monkeypatch.setattr(socket, 'getaddrinfo', blocked)
+
+
+@pytest.fixture(autouse=True)
+def isolate_error_log(monkeypatch, tmp_path):
+    monkeypatch.setattr('thebundl.observability.ERROR_LOG', tmp_path / 'pipeline-errors.txt')
+    monkeypatch.setattr('thebundl.__main__.ERROR_LOG', tmp_path / 'pipeline-errors.txt')

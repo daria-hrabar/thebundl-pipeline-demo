@@ -219,15 +219,14 @@ def test_out_of_range_branch_is_rejected(services):
     assert not calls.inserts
 
 
-def test_dry_run_retries_failed_collection_immediately(services):
+def test_dry_run_respects_daily_failed_collection_interval(services):
     calls, settings = services
     calls.fail = 'http'
     assert main(['run', '--publish', '--limit', '5']) == 1
     calls.fail = None
-    assert main(['run', '--dry-run', '--limit', '5']) == 0
-    assert calls.pages == 2 and calls.ai == 1
-    assert main(['run', '--dry-run', '--limit', '5']) == 0
-    assert calls.pages == 2 and calls.ai == 2
+    assert main(['run', '--dry-run', '--limit', '5']) == 1
+    assert calls.pages == 1 and calls.ai == 0
+    assert artifact(settings)['errors'][0]['error_type'] == 'CollectionIntervalError'
     assert not calls.inserts and not calls.source_rows
 
 
@@ -320,3 +319,59 @@ def test_report_counts_legacy_and_new_extraction_names(tmp_path):
     assert second.name == f'{now.month}-{now.day}-report-2.json'
     assert json.loads(first.read_text())['distinct_new_deals'] == 6
     assert json.loads(second.read_text())['distinct_new_deals'] == 6
+
+
+def test_extraction_rejection_details_are_retained(services):
+    calls, settings = services
+    calls.deals = [{**DEAL, 'description': 'invented offer'}]
+    assert main(['run', '--dry-run', '--limit', '5']) == 0
+    rejected = artifact(settings)['rejected']
+    assert len(rejected) == 1
+    assert rejected[0]['reason_codes'] == ['offer_or_branch_not_supported']
+    assert rejected[0]['candidate']['description'] == 'invented offer'
+    assert rejected[0]['stage'] == 'extraction'
+
+
+def test_blocked_source_is_skipped_before_limit_and_recovers(services, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+    calls, settings = services
+    calls.sources = 2
+    assert main(['discover', '--dry-run', '--limit', '5']) == 0
+    original = pipeline.collect_sources
+    def blocked(sources, **kwargs):
+        if str(sources[0].url).endswith('/0'):
+            return [collection.CollectionResult(sources[0], None, 'HTTP 403')]
+        return original(sources, **kwargs)
+    monkeypatch.setattr(pipeline, 'collect_sources', blocked)
+    assert main(['run', '--dry-run', '--limit', '1']) == 1
+    assert main(['run', '--dry-run', '--limit', '1']) == 0
+    report = artifact(settings)
+    assert len(report['skipped_sources']) == 1
+    assert report['sources'][0]['url'].endswith('/1')
+    assert report['accepted']
+    state_path = settings.work_dir / 'collection-state.json'
+    state = json.loads(state_path.read_text())
+    state['https://food.test/deals/0']['cooldown_until'] = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    state['https://food.test/deals/0']['attempted_at'] = (datetime.now(UTC) - timedelta(days=15)).isoformat()
+    state_path.write_text(json.dumps(state))
+    monkeypatch.setattr(pipeline, 'collect_sources', original)
+    assert main(['run', '--dry-run', '--limit', '1']) == 0
+    assert not artifact(settings)['skipped_sources']
+
+
+def test_rejections_survive_later_chunk_failure(services, monkeypatch):
+    from thebundl.ai import groq_provider
+    calls, settings = services
+    calls.deals = [{**DEAL, 'description': 'invented offer'}]
+    monkeypatch.setattr(groq_provider, 'chunk_text', lambda text: [text, text])
+    original = groq_provider.GroqExtractor._extract_chunk
+    def chunk(self, text, url, index):
+        if index == 2:
+            raise groq_provider.ExtractionError('fixture failure')
+        return original(self, text, url, index)
+    monkeypatch.setattr(groq_provider.GroqExtractor, '_extract_chunk', chunk)
+    assert main(['run', '--dry-run', '--limit', '5']) == 1
+    report = artifact(settings)
+    assert report['counts']['candidates_rejected'] == 1
+    assert report['rejected'][0]['reason_codes'] == ['offer_or_branch_not_supported']
+    assert report['errors'][0]['stage'] == 'extraction'

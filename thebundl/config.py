@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     max_sources_per_run: int = Field(default=20, ge=1)
     http_timeout_seconds: float = Field(default=15.0, gt=0)
     domain_pacing_seconds: float = Field(default=1.0, ge=0)
+    source_cooldown_days: int = Field(default=14, ge=1)
+    branch_cache_days: int = Field(default=30, ge=1)
     work_dir: Path = Path("work")
     campuses: tuple[Campus, Campus] = (BARUCH_COLLEGE, COLUMBIA_UNIVERSITY)
 

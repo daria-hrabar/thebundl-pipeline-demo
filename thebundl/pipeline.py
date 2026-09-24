@@ -17,7 +17,7 @@ from .discovery import discover_sources, discovery_due, known_sources
 from .schemas import ExtractedPage
 from .storage import existing_fingerprints, publish_candidates, publish_sources
 from .observability import progress, record_error
-from .validation import StructuredDataGeocoder, validate_candidate
+from .validation import validate_with_branch_pages
 
 
 def _write(path: Path, payload: dict) -> None:
@@ -65,7 +65,7 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                             'candidates_rejected', 'duplicates', 'deals_inserted'), 0)
     payload = {'timestamp': now.isoformat(), 'command': command, 'limit': limit,
                'publish_requested': publish, 'status': 'running', 'counts': counts,
-               'errors': [], 'sources': [], 'accepted': [], 'rejected': []}
+               'errors': [], 'sources': [], 'accepted': [], 'rejected': [], 'branch_verifications': []}
     stage = 'configuration'
     limit = min(limit or settings.max_sources_per_run, settings.max_sources_per_run)
     try:
@@ -77,7 +77,19 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
         counts['sources_found'] = len(found)
         payload['discovery_status'] = 'executed' if due else 'not_due'
         progress(f"Discovery: {payload['discovery_status']}; source staging file: {settings.work_dir / 'known-sources.json'}")
-        sources = sorted(known_sources(settings), key=lambda source: source.priority, reverse=True)[:limit]
+        state_path = settings.work_dir / 'collection-state.json'
+        state = _read(state_path)
+        payload['skipped_sources'] = []
+        eligible = []
+        for source in sorted(known_sources(settings), key=lambda source: source.priority, reverse=True):
+            entry = state.get(str(source.url), {})
+            until = entry.get('cooldown_until')
+            if until and now < datetime.fromisoformat(until):
+                payload['skipped_sources'].append(dict(source_url=str(source.url),
+                    reason_code=entry.get('failure_reason'), retry_after=until))
+            else:
+                eligible.append(source)
+        sources = eligible[:limit]
         payload['sources'] = [source.model_dump(mode='json') for source in sources]
         if command == 'run':
             stage = 'extraction configuration'
@@ -93,7 +105,7 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                     stage = 'collection'
                     entry = state.get(url)
                     progress(f'Processing source {source_index}/{len(sources)}')
-                    if entry and (entry.get('page') or publish) and now - datetime.fromisoformat(entry['attempted_at']) < timedelta(hours=settings.collection_interval_hours):
+                    if entry and now - datetime.fromisoformat(entry['attempted_at']) < timedelta(hours=settings.collection_interval_hours):
                         if not entry.get('page'):
                             payload['errors'].append({'stage': stage, 'error_type': 'CollectionIntervalError', 'source_url': url,
                                                       'message': 'Previous collection failed; next attempt allowed after daily interval'})
@@ -112,6 +124,10 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                                                  pace_seconds=settings.domain_pacing_seconds)[0]
                         last_fetch[domain] = time.monotonic()
                         if result.page is None:
+                            state[url]['failure_reason'] = result.reason
+                            if result.reason in {'HTTP 401', 'HTTP 403', 'HTTP 404', 'HTTP 410'}:
+                                state[url]['cooldown_until'] = (now + timedelta(days=settings.source_cooldown_days)).isoformat()
+                            _write(state_path, state)
                             payload['errors'].append({'stage': stage, 'error_type': 'CollectionError', 'source_url': url, 'message': result.reason})
                             continue
                         page = result.page
@@ -121,6 +137,7 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                     stage = 'extraction'
                     before = {key: getattr(extractor, key, 0) for key in
                               ('candidates_extracted', 'candidates_rejected', 'duplicates')}
+                    rejection_start = len(getattr(extractor, 'rejections', []))
                     try:
                         candidates = extractor.extract(page.text, str(page.source_url))
                     except Exception as error:
@@ -128,6 +145,7 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                                                   'message': f'{type(error).__name__}; check AI credentials, model, service availability and request budget'})
                         continue
                     finally:
+                        payload['rejected'].extend(getattr(extractor, 'rejections', [])[rejection_start:])
                         payload['ai_requests_used'] = getattr(extractor, 'requests_used', 0)
                         payload['ai_reserved_cost_usd'] = payload['ai_requests_used'] * settings.ai_cost_per_request_usd
                         for key, value in before.items():
@@ -138,15 +156,22 @@ def execute_pipeline(settings: Settings, command: str, *, limit: int | None, pub
                         counts['candidates_extracted'] += len(candidates)
                     for candidate in candidates:
                         stage = 'validation'
-                        result = validate_candidate(candidate, page,
-                            geocoder=StructuredDataGeocoder(page, candidate.business_name), campuses=settings.campuses)
-                        if not result.accepted:
-                            counts['candidates_rejected'] += 1
-                            payload['rejected'].append(result.model_dump(mode='json'))
-                        elif exact_duplicate(result.candidate, accepted):
-                            counts['duplicates'] += 1
-                        else:
-                            accepted.append(result.candidate)
+                        branch_pages = [ExtractedPage.model_validate(item['page']) for item in state.values()
+                            if item.get('page') and now - datetime.fromisoformat(item['attempted_at'])
+                            < timedelta(days=settings.branch_cache_days)]
+                        for result in validate_with_branch_pages(candidate, page, branch_pages, settings.campuses):
+                            if not result.accepted:
+                                counts['candidates_rejected'] += 1
+                                rejection = result.model_dump(mode='json')
+                                rejection.update(stage='validation', source_url=str(page.source_url))
+                                payload['rejected'].append(rejection)
+                            elif exact_duplicate(result.candidate, accepted):
+                                counts['duplicates'] += 1
+                            else:
+                                accepted.append(result.candidate)
+                                if result.branch_evidence_urls:
+                                    payload['branch_verifications'].append(dict(fingerprint=result.candidate.fingerprint,
+                                        source_urls=result.branch_evidence_urls))
             payload['accepted'] = [deal.model_dump(mode='json') for deal in accepted]
             validated_urls = {str(deal.source_url) for deal in accepted}
             stage = 'duplicate lookup'

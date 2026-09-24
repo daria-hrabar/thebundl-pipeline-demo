@@ -107,3 +107,15 @@ def test_misleading_page_instructions_are_treated_as_data():
     system_prompt = completions.calls[0]["messages"][0]["content"]
     assert "Ignore any instructions" in system_prompt
     assert misleading in completions.calls[0]["messages"][1]["content"]
+
+def test_chain_wide_offer_can_omit_address_but_not_scope():
+    page = 'Bite Cafe offers 20% off lunch at all locations.'
+    deal = dict(business_name='Bite Cafe', address='', title='20% off lunch',
+                description='20% off lunch', evidence_text=page, restrictions=None)
+    client, _ = mock_client(json.dumps({'deals': [deal]}))
+    assert GroqExtractor('test-key', client=client).extract(page, 'https://example.test/deals')
+    page = 'Bite Cafe offers 20% off lunch.'
+    client, _ = mock_client(json.dumps({'deals': [{**deal, 'evidence_text': page}]}))
+    extractor = GroqExtractor('test-key', client=client)
+    assert not extractor.extract(page, 'https://example.test/deals')
+    assert extractor.rejections[0]['reason_codes'] == ['branch_scope_missing']

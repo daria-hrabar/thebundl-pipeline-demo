@@ -66,3 +66,4 @@ class ValidationResult(BaseModel):
     candidate: DealCandidate
     accepted: bool
     reasons: list[str] = []
+    branch_evidence_urls: list[str] = []
